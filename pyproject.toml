@@ -1,0 +1,33 @@
+[project]
+name = "haivemind"
+version = "0.1.0"
+description = "Multi-model AI consensus loop via OpenCode CLI"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "dev-boz" },
+]
+keywords = ["llm", "consensus", "multi-model", "ai", "opencode"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/dev-boz/haivemind"
+Repository = "https://github.com/dev-boz/haivemind"
+Issues = "https://github.com/dev-boz/haivemind/issues"
+
+[project.scripts]
+haivemind = "haivemind:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
