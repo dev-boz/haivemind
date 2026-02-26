@@ -123,8 +123,10 @@ This shows the core thesis: no single model is the arbiter. One model spotted th
 
 1. **Probe** — Each model gets a health check (`"Reply with exactly: OK"`). Failing models are dropped.
 2. **Round loop** — All active models receive the user prompt + room rules + previous round's drafts. They respond with structured JSON containing a `draft`, `key_points`, `disagreements`, `changes_made`, and `confidence`.
-3. **Consensus check** — Drafts are normalized and compared pairwise. If a group of `--min-agree` models are within `--threshold` similarity, the most central draft (medoid) is chosen as the final answer.
-4. **Fallback** — If no consensus after `--rounds`, the most central draft from the last round is selected.
+3. **JSON retry** — If a model returns invalid JSON or is missing a `draft` field, it gets retried within the same round (configurable via `--json-retries`).
+4. **Model health tracking** — Models that fail multiple consecutive rounds are automatically dropped from the active roster, so one broken model doesn't poison the whole run.
+5. **Consensus check** — Parsed `draft` fields (not raw text) are normalized and compared pairwise. If a group of `--min-agree` models are within `--threshold` similarity, the most central draft (medoid) is chosen as the final answer. Self-reported `confidence` scores act as a tiebreaker.
+6. **Fallback** — If no consensus after `--rounds`, the most central draft is selected, preferring models that produced valid structured JSON.
 
 ## CLI reference
 
@@ -138,10 +140,12 @@ This shows the core thesis: no single model is the arbiter. One model spotted th
 | `--parallel` | `3` | Max concurrent model calls |
 | `--outdir` | `tmp/haivemind` | Base output directory |
 | `--opencode-bin` | `opencode` | Path to opencode binary |
-| `--opencode-agent` | `compaction` | OpenCode agent name |
+| `--opencode-agent` | none | OpenCode agent name |
 | `--probe / --no-probe` | `--probe` | Preflight health check |
 | `--probe-timeout` | `60` | Probe timeout (seconds) |
 | `--probe-retries` | `1` | Probe retries per model |
+| `--json-retries` | `1` | Retries per model on invalid JSON within a round |
+| `--max-consecutive-failures` | `2` | Drop a model after N consecutive round failures |
 | `--live` | off | Stream output live to stderr |
 | `--live-compact` | off | Prefix live fragments with model id |
 | `--show-log` | off | Print artifact paths to stderr |
@@ -177,8 +181,11 @@ See [ORIGIN.md](ORIGIN.md) for more on the premise and theory behind this projec
 ## Notes
 
 - The agent prompt forces JSON output so we can extract a `draft` field reliably.
-- Some models may not comply; those are kept as raw drafts and recorded under `errors`.
+- Models that return invalid JSON get retried automatically (`--json-retries`). If they keep failing across rounds, they get dropped (`--max-consecutive-failures`).
+- Consensus comparison uses the parsed `draft` field, not raw output. This prevents meta-summaries or formatting noise from breaking similarity detection.
+- Models self-report a `confidence` score (0-1). This is used as a small tiebreaker when selecting the medoid draft, not as a primary signal.
 - Convergence is based on `difflib.SequenceMatcher` similarity; for code-heavy outputs you may want a lower threshold.
+- No default `--opencode-agent` is set, since some agents (e.g. `compaction`) have system prompts that conflict with the room rules.
 
 ## License
 

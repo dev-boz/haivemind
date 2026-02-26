@@ -23,7 +23,7 @@ import textwrap
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,14 @@ Schema:
   "confidence": number           // 0.0 - 1.0
 }
 """
+
+# ---------------------------------------------------------------------------
+# Default number of consecutive failures before a model is dropped mid-run.
+# ---------------------------------------------------------------------------
+_DEFAULT_MAX_CONSECUTIVE_FAILURES = 2
+
+# Default number of retries when a model returns invalid JSON within a round.
+_DEFAULT_JSON_RETRIES = 1
 
 
 def _now_slug() -> str:
@@ -320,6 +328,23 @@ class AgentRound:
         # Last resort: treat raw as a draft.
         return (self.raw_text or "").strip()
 
+    @property
+    def has_valid_draft(self) -> bool:
+        """True when the model returned parseable JSON with a draft field."""
+        return (
+            self.parsed is not None
+            and isinstance(self.parsed.get("draft"), str)
+            and bool(self.parsed["draft"].strip())
+        )
+
+    @property
+    def confidence(self) -> float:
+        """Return the model's self-reported confidence, defaulting to 0.5."""
+        if self.parsed and isinstance(self.parsed.get("confidence"), (int, float)):
+            c = float(self.parsed["confidence"])
+            return max(0.0, min(1.0, c))
+        return 0.5
+
 
 def _build_agent_prompt(
     *,
@@ -371,6 +396,7 @@ def _find_consensus(
     min_agree: int,
     basis_by_model: dict[str, str] | None = None,
     key_points_by_model: dict[str, list[str]] | None = None,
+    confidence_by_model: dict[str, float] | None = None,
 ) -> tuple[list[str], str] | None:
     models = [m for m, d in drafts_by_model.items() if d.strip()]
     if len(models) < min_agree:
@@ -432,13 +458,22 @@ def _find_consensus(
     groups.sort(key=lambda g: (-len(g), ",".join(g)))
     best_group = groups[0]
 
+    # Confidence weighting: when selecting the medoid, factor in each model's
+    # self-reported confidence so higher-confidence models are preferred when
+    # similarity is otherwise close.
+    conf = confidence_by_model or {}
+
     def avg_sim(m: str) -> float:
         others = [o for o in best_group if o != m]
         if not others:
             return 1.0
-        return sum(sim.get((m, o), _ratio(norm[m], norm[o])) for o in others) / len(
+        raw = sum(sim.get((m, o), _ratio(norm[m], norm[o])) for o in others) / len(
             others
         )
+        # Blend in confidence as a small bonus (up to 5%) so it acts as a
+        # tiebreaker rather than overriding similarity.
+        c = conf.get(m, 0.5)
+        return raw + 0.05 * c
 
     medoid = max(best_group, key=avg_sim)
     return (best_group, drafts_by_model[medoid].strip())
@@ -533,8 +568,8 @@ def main(argv: list[str]) -> int:
             hAIvemind: bounce a prompt across multiple models until their drafts converge.
 
             Example:
-              python haivemind.py \
-                --models google/gemini-3-flash-preview,google/gemini-2.5-flash,qwen/qwen3-coder-plus \
+              python haivemind.py \\
+                --models google/gemini-3-flash-preview,google/gemini-2.5-flash,qwen/qwen3-coder-plus \\
                 "Write a robust bash function to ..."
             """
         ),
@@ -581,8 +616,8 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--opencode-agent",
-        default=os.environ.get("OPENCODE_AGENT", "compaction"),
-        help="OpenCode agent name (default: OPENCODE_AGENT or 'compaction')",
+        default=os.environ.get("OPENCODE_AGENT", ""),
+        help="OpenCode agent name (default: OPENCODE_AGENT env var, or none)",
     )
     parser.add_argument(
         "--probe",
@@ -601,6 +636,24 @@ def main(argv: list[str]) -> int:
         type=int,
         default=1,
         help="Probe retries per model (default: 1)",
+    )
+    parser.add_argument(
+        "--json-retries",
+        type=int,
+        default=_DEFAULT_JSON_RETRIES,
+        help=(
+            "Retries per model when it returns invalid JSON within a round "
+            f"(default: {_DEFAULT_JSON_RETRIES})"
+        ),
+    )
+    parser.add_argument(
+        "--max-consecutive-failures",
+        type=int,
+        default=_DEFAULT_MAX_CONSECUTIVE_FAILURES,
+        help=(
+            "Drop a model after this many consecutive round failures "
+            f"(default: {_DEFAULT_MAX_CONSECUTIVE_FAILURES})"
+        ),
     )
     parser.add_argument(
         "--live",
@@ -650,6 +703,8 @@ def main(argv: list[str]) -> int:
         "probe": args.probe,
         "probe_timeout_s": args.probe_timeout,
         "probe_retries": args.probe_retries,
+        "json_retries": args.json_retries,
+        "max_consecutive_failures": args.max_consecutive_failures,
     }
     _write_json(run_dir / "meta.json", meta)
 
@@ -737,6 +792,19 @@ def main(argv: list[str]) -> int:
                 )
                 sys.stderr.flush()
 
+    # -----------------------------------------------------------------------
+    # Per-model consecutive failure tracker.  When a model fails this many
+    # rounds in a row (invalid JSON, timeout, etc.) it gets dropped.
+    # -----------------------------------------------------------------------
+    consecutive_failures: dict[str, int] = {m: 0 for m in models}
+    dropped_models: dict[str, str] = {}  # model -> reason
+
+    json_retries = max(0, int(args.json_retries))
+    max_consec = max(1, int(args.max_consecutive_failures))
+
+    # Last round's results, kept outside the loop so the fallback can access it.
+    results: dict[str, AgentRound] = {}
+
     for round_index in range(1, int(args.rounds) + 1):
         round_started = time.time()
         prompt_for_agents = _build_agent_prompt(
@@ -754,7 +822,7 @@ def main(argv: list[str]) -> int:
             prompt_for_agents + "\n", encoding="utf-8"
         )
 
-        results: dict[str, AgentRound] = {}
+        results.clear()
 
         def key_points_list(ar: AgentRound) -> list[str]:
             if not ar.parsed:
@@ -764,17 +832,23 @@ def main(argv: list[str]) -> int:
                 return []
             return [kp for kp in kps if isinstance(kp, str)]
 
-        def call_model(m: str) -> AgentRound:
+        def _call_opencode_once(
+            m: str,
+            prompt: str,
+            round_idx: int,
+            rdir: Path,
+        ) -> AgentRound:
+            """Single attempt to call a model and parse the result."""
             try:
                 if args.live and not args.live_compact:
                     with live_lock:
-                        sys.stderr.write(f"\n=== {m} (round {round_index}) ===\n")
+                        sys.stderr.write(f"\n=== {m} (round {round_idx}) ===\n")
                         sys.stderr.flush()
                 raw, stderr = _run_opencode(
                     opencode_bin=args.opencode_bin,
                     opencode_agent=opencode_agent,
                     model=m,
-                    prompt=prompt_for_agents,
+                    prompt=prompt,
                     timeout_s=int(args.timeout),
                     cwd=run_dir,
                     live=bool(args.live),
@@ -815,17 +889,36 @@ def main(argv: list[str]) -> int:
                 err = "stderr"
 
             # Persist raw for theatre/debug.
-            (round_dir / f"{_slugify(m, max_len=80)}.raw.txt").write_text(
+            (rdir / f"{_slugify(m, max_len=80)}.raw.txt").write_text(
                 raw + "\n", encoding="utf-8"
             )
             if stderr:
-                (round_dir / f"{_slugify(m, max_len=80)}.stderr.txt").write_text(
+                (rdir / f"{_slugify(m, max_len=80)}.stderr.txt").write_text(
                     stderr + "\n", encoding="utf-8"
                 )
             if parsed is not None:
-                _write_json(round_dir / f"{_slugify(m, max_len=80)}.json", parsed)
+                _write_json(rdir / f"{_slugify(m, max_len=80)}.json", parsed)
 
             return AgentRound(model=m, raw_text=raw, parsed=parsed, error=err)
+
+        def call_model(m: str) -> AgentRound:
+            """Call a model with optional JSON retries."""
+            ar = _call_opencode_once(m, prompt_for_agents, round_index, round_dir)
+
+            # Retry on invalid JSON / missing draft (not on timeouts or hard errors).
+            retries_left = json_retries
+            while retries_left > 0 and ar.error in ("invalid_json", "missing_draft"):
+                retries_left -= 1
+                if args.live:
+                    with live_lock:
+                        sys.stderr.write(
+                            f"[{m}] retrying ({ar.error}, "
+                            f"{json_retries - retries_left}/{json_retries})...\n"
+                        )
+                        sys.stderr.flush()
+                ar = _call_opencode_once(m, prompt_for_agents, round_index, round_dir)
+
+            return ar
 
         with ThreadPoolExecutor(max_workers=max(1, int(args.parallel))) as ex:
             futs = {ex.submit(call_model, m): m for m in models}
@@ -833,7 +926,64 @@ def main(argv: list[str]) -> int:
                 m = futs[fut]
                 results[m] = fut.result()
 
-        drafts_by_model = {m: results[m].draft for m in models if m in results}
+        # -------------------------------------------------------------------
+        # Update consecutive failure counts and drop models that keep failing.
+        # -------------------------------------------------------------------
+        for m in list(models):
+            ar = results.get(m)
+            if ar and ar.has_valid_draft:
+                consecutive_failures[m] = 0
+            else:
+                consecutive_failures[m] = consecutive_failures.get(m, 0) + 1
+                if consecutive_failures[m] >= max_consec:
+                    reason = (
+                        f"dropped after {consecutive_failures[m]} consecutive failures"
+                    )
+                    dropped_models[m] = reason
+                    if args.live:
+                        with live_lock:
+                            sys.stderr.write(f"[{m}] {reason}\n")
+                            sys.stderr.flush()
+
+        # Remove dropped models from the active list.
+        if dropped_models:
+            models = [m for m in models if m not in dropped_models]
+            # Recalculate effective_min_agree after dropping.
+            effective_min_agree = min(int(args.min_agree), len(models))
+
+            # Persist updated active model list.
+            (run_dir / "models.active.txt").write_text(
+                "\n".join(models) + "\n", encoding="utf-8"
+            )
+
+        if not models:
+            print(
+                "All models dropped due to consecutive failures. "
+                "See artifacts in: " + str(run_dir),
+                file=sys.stderr,
+            )
+            # Still write history before bailing.
+            _write_json(run_dir / "history.json", history)
+            return 1
+
+        # -------------------------------------------------------------------
+        # Build drafts for consensus, preferring the parsed draft field over
+        # raw text so that meta-summaries from misbehaving agents don't
+        # pollute the comparison.
+        # -------------------------------------------------------------------
+        drafts_by_model: dict[str, str] = {}
+        for m in models:
+            if m not in results:
+                continue
+            ar = results[m]
+            if ar.has_valid_draft:
+                drafts_by_model[m] = ar.parsed["draft"].strip()  # type: ignore[index]
+            else:
+                # Fallback to raw, but only if there's something there.
+                raw_d = (ar.raw_text or "").strip()
+                if raw_d:
+                    drafts_by_model[m] = raw_d
+
         consensus = _find_consensus(
             drafts_by_model,
             threshold=float(args.threshold),
@@ -842,9 +992,12 @@ def main(argv: list[str]) -> int:
             key_points_by_model={
                 m: (key_points_list(results[m]) if m in results else []) for m in models
             },
+            confidence_by_model={
+                m: (results[m].confidence if m in results else 0.5) for m in models
+            },
         )
 
-        round_record = {
+        round_record: dict[str, Any] = {
             "round": round_index,
             "started_at": _dt.datetime.fromtimestamp(round_started).isoformat(
                 timespec="seconds"
@@ -853,7 +1006,7 @@ def main(argv: list[str]) -> int:
             "drafts": drafts_by_model,
             "errors": {
                 m: results[m].error
-                for m in models
+                for m in list(drafts_by_model) + list(dropped_models)
                 if results.get(m) and results[m].error
             },
             "consensus": {
@@ -863,6 +1016,8 @@ def main(argv: list[str]) -> int:
             if consensus
             else None,
         }
+        if dropped_models:
+            round_record["dropped_models"] = dict(dropped_models)
         history.append(round_record)
         _write_json(run_dir / "history.json", history)
 
@@ -880,6 +1035,7 @@ def main(argv: list[str]) -> int:
 
     if not consensus:
         # Fallback: pick the most central draft from the last round.
+        # Prefer models that produced valid JSON drafts.
         last = history[-1]["drafts"] if history else {}
         models_with_drafts = [
             m for m in models if isinstance(last.get(m), str) and last[m].strip()
@@ -891,14 +1047,24 @@ def main(argv: list[str]) -> int:
             )
             return 1
 
+        # Partition into valid-JSON models and raw-fallback models.
+        valid_json_models = [
+            m for m in models_with_drafts if m in results and results[m].has_valid_draft
+        ]
+        # Prefer valid JSON models for centrality; fall back to all if none.
+        candidate_pool = valid_json_models if valid_json_models else models_with_drafts
+
         def centrality(m: str) -> float:
             d = last[m]
-            others = [o for o in models_with_drafts if o != m]
+            others = [o for o in candidate_pool if o != m]
             if not others:
                 return 1.0
-            return sum(_ratio(d, last[o]) for o in others) / len(others)
+            base = sum(_ratio(d, last[o]) for o in others) / len(others)
+            # Small confidence bonus as tiebreaker.
+            c = results[m].confidence if m in results else 0.5
+            return base + 0.05 * c
 
-        best = max(models_with_drafts, key=centrality)
+        best = max(candidate_pool, key=centrality)
         draft = str(last[best]).strip()
         (run_dir / "final.md").write_text(draft + "\n", encoding="utf-8")
         (run_dir / "final.txt").write_text(draft + "\n", encoding="utf-8")
