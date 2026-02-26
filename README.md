@@ -90,6 +90,35 @@ tmp/haivemind/<timestamp>_<prompt-slug>/
       ...
 ```
 
+## Example: The car wash debate
+
+Here's a real run showing 3 models debating a trick question across 5 rounds. Two models initially said "walk" but got convinced by the third model's logic — you need your car at the car wash.
+
+```bash
+python haivemind.py \
+  --live --live-compact \
+  --models opencode/big-pickle,modal/zai-org/GLM-5-FP8,opencode/minimax-m2.5-free \
+  "The car wash is only 100m from my house, should I drive or walk?"
+```
+
+**Round 1** — Two models say walk, one says drive:
+- `big-pickle`: "Walk. 100m is a 1-minute walk, driving wastes fuel..." (confidence: 0.95)
+- `minimax-m2.5-free`: "Walk. Driving involves starting engine, braking, parking..." (confidence: 0.90)
+- `GLM-5-FP8`: "Drive. The purpose of going to a car wash is to wash your car, which requires having your car present." (confidence: 0.95)
+
+**Round 2** — GLM-5's argument lands. minimax flips:
+- `minimax-m2.5-free`: "Drive. The critical point from GLM-5 changed my thinking — you need your car at the car wash." (changes_made: "Adopted the driving recommendation based on the logical necessity of having the car present")
+
+**Round 3** — big-pickle concedes too:
+- `big-pickle`: "Drive. Changed position from 'walk' to 'drive' based on the valid counterargument that walking leaves your car at home."
+
+**Rounds 4-5** — All three models converge on the same answer. Consensus reached.
+
+**Final output:**
+> Drive. The car wash requires your car to be physically present — you cannot wash a vehicle that stays at home. Walking 100m means arriving without your car, then having to walk back and drive anyway, making the walk pointless. The distance is so short that fuel consumption is negligible, and driving is the only option that actually accomplishes the goal of getting your car washed.
+
+This shows the core thesis: no single model is the arbiter. One model spotted the logical flaw, defended it with evidence, and the others independently verified and conceded.
+
 ## How it works
 
 1. **Probe** — Each model gets a health check (`"Reply with exactly: OK"`). Failing models are dropped.
@@ -131,6 +160,19 @@ Sanity check a model directly:
 ```bash
 opencode run -m <provider/model> --format json "Reply with exactly: OK"
 ```
+
+## The idea
+
+hAIvemind treats LLMs like people locked in a room who can't leave until they agree on the correct answer. There's no arbiter, no judge, no "smartest model in the room." Consensus emerges from the process:
+
+- Models read each other's drafts and independently verify claims
+- They adopt fluid roles — critic, builder, skeptic, synthesizer — based on what the conversation needs
+- Sycophancy is countered by the room rules: "do not agree just to agree"
+- Coverage beats individual intelligence: Model A catches bug X but misses Y; Model B catches Y but misses X; together they catch both
+
+The core framework is intentionally minimal: a loop, a shared space, and a prompt that creates social dynamics between models. The intelligence emerges from interaction, not from any single model.
+
+See [ORIGIN.md](ORIGIN.md) for the full brainstorming session that led to this project.
 
 ## Notes
 
