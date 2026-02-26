@@ -172,7 +172,7 @@ hAIvemind treats LLMs like people locked in a room who can't leave until they ag
 
 The core framework is intentionally minimal: a loop, a shared space, and a prompt that creates social dynamics between models. The intelligence emerges from interaction, not from any single model.
 
-See [ORIGIN.md](ORIGIN.md) for the full brainstorming session that led to this project.
+See [ORIGIN.md](ORIGIN.md) for more on the premise and theory behind this project.
 
 ## Notes
 
